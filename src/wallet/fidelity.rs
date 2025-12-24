@@ -1,7 +1,7 @@
 use crate::{
     protocol::messages::FidelityProof,
     utill::{redeemscript_to_scriptpubkey, verify_fidelity_checks, MIN_FEE_RATE},
-    wallet::Wallet,
+    wallet::{api::UTXOSpendInfo, Wallet},
 };
 use bitcoin::{
     absolute::LockTime,
@@ -413,6 +413,76 @@ impl Wallet {
             log::info!("Fidelity Bond at index: {i:?} expired | Redeeming it.");
             self.redeem_fidelity(i, MIN_FEE_RATE).map(|_| ())
         })
+    }
+
+    /// Redeem a Fidelity Bond.
+    /// This function creates a spending transaction from the fidelity bond, signs and broadcasts it.
+    /// Returns the txid of the spending tx, and mark the bond as spent.
+    fn redeem_fidelity(&mut self, idx: u32, feerate: f64) -> Result<(), WalletError> {
+        let bond = self
+            .store
+            .fidelity_bond
+            .get(&idx)
+            .ok_or(FidelityError::BondDoesNotExist)?;
+
+        if bond.is_spent {
+            log::info!("Fidelity bond already spent.");
+            return Ok(());
+        }
+
+        let expired_fidelity_spend_info = UTXOSpendInfo::FidelityBondCoin {
+            index: idx,
+            input_value: bond.amount,
+        };
+
+        let change_addr = &self.get_next_internal_addresses(1)?[0];
+        let destination = Destination::Sweep(change_addr.clone());
+
+        // Find utxo corresponding to expired fidelity bond.
+        let utxo = match self
+            .list_fidelity_spend_info()
+            .iter()
+            .find(|(_, spend_info)| *spend_info == expired_fidelity_spend_info)
+        {
+            Some((utxo, _)) => utxo,
+            None => {
+                // If no UTXO is found for the expired fidelity bond, it means the bond was already spent,
+                // but its `redeemed` flag was never updated. This is a known issue where the redemption
+                // transaction was broadcasted, but the flag remained unset.
+                // As a temporary fix, we mark the bond as redeemed and exit gracefully.
+                log::info!("Fidelity bond already spent.");
+
+                let bond = self
+                    .store
+                    .fidelity_bond
+                    .get_mut(&idx)
+                    .ok_or(FidelityError::BondDoesNotExist)?;
+                bond.is_spent = true;
+
+                return Ok(());
+            }
+        }
+        .clone();
+
+        let tx = self.spend_coins(&[(utxo, expired_fidelity_spend_info)], destination, feerate)?;
+        let txid = self.send_tx(&tx)?;
+
+        log::info!("Fidelity redeem transaction broadcasted. txid: {txid}");
+
+        // No need to wait for confirmation as that will delay the rpc call. Just send back the txid.
+
+        // mark is_spent
+        {
+            let bond = self
+                .store
+                .fidelity_bond
+                .get_mut(&idx)
+                .ok_or(FidelityError::BondDoesNotExist)?;
+
+            bond.is_spent = true;
+        }
+
+        Ok(())
     }
 
     /// Generate a [`FidelityProof`] for bond at a given index and a specific onion address.

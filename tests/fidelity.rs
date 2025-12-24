@@ -181,7 +181,7 @@ fn test_fidelity() {
             if required_height == first_maturity_height {
                 log::info!("🔓 First Fidelity Bond is matured. Sending redemption transaction");
 
-                wallet_write.redeem_fidelity(0, MIN_FEE_RATE).unwrap();
+                wallet_write.redeem_expired_fidelity_bonds().unwrap();
 
                 log::info!("✅ First Fidelity Bond is successfully redeemed");
 
@@ -195,7 +195,7 @@ fn test_fidelity() {
             } else {
                 log::info!("🔓 Second Fidelity Bond is matured. Sending redemption transaction");
 
-                wallet_write.redeem_fidelity(1, MIN_FEE_RATE).unwrap();
+                wallet_write.redeem_expired_fidelity_bonds().unwrap();
 
                 log::info!("✅ Second Fidelity Bond is successfully redeemed");
 
@@ -409,9 +409,7 @@ fn test_fidelity_spending() {
 
     {
         let mut wallet = maker.get_wallet().write().unwrap();
-        wallet
-            .redeem_fidelity(fidelity_index, MIN_FEE_RATE)
-            .unwrap();
+        wallet.redeem_expired_fidelity_bonds().unwrap();
     }
 
     generate_blocks(bitcoind, 1);

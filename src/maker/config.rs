@@ -6,11 +6,16 @@
 use crate::utill::parse_toml;
 use std::{io, path::Path};
 
-use std::io::Write;
+use std::io::{Error, Write};
 
 use crate::utill::{get_maker_dir, parse_field};
 
 use super::api::MIN_SWAP_AMOUNT;
+
+/// Minimum timelock 3 months in blocks
+const MIN_FIDELITY_TIMELOCK: u32 = 13_104;
+/// Maximum timelock 6 months in blocks
+const MAX_FIDELITY_TIMELOCK: u32 = 26_000;
 
 /// Maker Configuration
 ///
@@ -35,7 +40,7 @@ pub struct MakerConfig {
     pub min_swap_amount: u64,
     /// Fidelity Bond amount in satoshis
     pub fidelity_amount: u64,
-    /// Fidelity Bond relative timelock in number of blocks
+    /// Fidelity Bond relative timelock in number of blocks(13,104 - 26,000)
     pub fidelity_timelock: u32,
     /// A fixed base fee charged by the Maker for providing its services
     pub base_fee: u64,
@@ -49,7 +54,7 @@ impl Default for MakerConfig {
             if cfg!(feature = "integration-test") {
                 (5_000_000, 26_000, 1000, 2.50) // Test values
             } else {
-                (50_000, 13104, 100, 0.1) // Production values
+                (50_000, MIN_FIDELITY_TIMELOCK, 100, 0.1) // Production values
             };
 
         Self {
@@ -101,6 +106,13 @@ impl MakerConfig {
             config_path.display()
         );
 
+        // Check if the fidelity_timelock is within range
+        let fidelity_timelock_value = parse_field(
+            config_map.get("fidelity_timelock"),
+            default_config.fidelity_timelock,
+        );
+        validate_fidelity_timelock(fidelity_timelock_value)?;
+
         Ok(MakerConfig {
             rpc_port: parse_field(config_map.get("rpc_port"), default_config.rpc_port),
             min_swap_amount: parse_field(
@@ -118,10 +130,7 @@ impl MakerConfig {
                 config_map.get("fidelity_amount"),
                 default_config.fidelity_amount,
             ),
-            fidelity_timelock: parse_field(
-                config_map.get("fidelity_timelock"),
-                default_config.fidelity_timelock,
-            ),
+            fidelity_timelock: fidelity_timelock_value,
             base_fee: parse_field(config_map.get("base_fee"), default_config.base_fee),
             amount_relative_fee_pct: parse_field(
                 config_map.get("amount_relative_fee_pct"),
@@ -174,6 +183,16 @@ amount_relative_fee_pct = {}
         file.flush()?;
         Ok(())
     }
+}
+
+fn validate_fidelity_timelock(value: u32) -> Result<(), Error> {
+    if !(MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&value) {
+        return Err(Error::other(format!(
+            "fidelity_timelock should be from {} to {}, entered value {}",
+            MIN_FIDELITY_TIMELOCK, MAX_FIDELITY_TIMELOCK, value
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -251,5 +270,25 @@ mod tests {
         let config = MakerConfig::new(Some(&config_path)).unwrap();
         remove_temp_config(&config_path);
         assert_eq!(config, MakerConfig::default());
+    }
+
+    #[test]
+    fn test_fidelity_timelock() {
+        let cases = [
+            (12000, false),
+            (13104, true),
+            (18000, true),
+            (26000, true),
+            (27000, false),
+        ];
+        for (timelock, should_pass) in cases {
+            let contents = format!("fidelity_timelock = {}", timelock);
+            let config_path = create_temp_config(&contents, "timelock_test.toml");
+
+            let config = MakerConfig::new(Some(&config_path));
+            assert_eq!(config.is_ok(), should_pass,);
+
+            remove_temp_config(&config_path);
+        }
     }
 }
