@@ -2,6 +2,7 @@ on:
   push:
     branches:
       - master
+      - sync-imp
   pull_request:
 
 name: test
