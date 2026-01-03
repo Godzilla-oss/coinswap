@@ -2,6 +2,7 @@ on:
   push:
     branches:
       - master
+      - sync-api-test
   pull_request:
 
 name: test
