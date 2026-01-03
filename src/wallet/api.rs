@@ -2493,6 +2493,9 @@ impl Wallet {
             witness: Witness::new(), // Will be filled later
         };
 
+        // sync wallet to update utxo cache before getting destination address
+        self.sync_and_save()?;
+
         // Get destination address
         let destination = self.get_next_internal_addresses(1, AddressType::P2WPKH)?[0].clone();
 
@@ -2637,6 +2640,9 @@ impl Wallet {
             script_sig: bitcoin::ScriptBuf::new(),
             witness: Witness::new(),
         };
+
+        // sync wallet to update utxo cache before getting destination address
+        self.sync_and_save()?;
 
         // Get destination
         let destination = self.get_next_internal_addresses(1, AddressType::P2WPKH)?[0].clone();

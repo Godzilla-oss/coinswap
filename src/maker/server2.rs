@@ -411,6 +411,7 @@ fn check_swap_liquidity_taproot(maker: &Maker) -> Result<(), MakerError> {
     let balances = wallet_read.get_balances()?;
 
     let swap_balance = balances.spendable;
+    let offer_max_size = wallet_read.store.offer_maxsize;
     let ongoing_swaps_count = maker.ongoing_swap_state.lock()?.len();
 
     if swap_balance == Amount::ZERO {
@@ -422,7 +423,7 @@ fn check_swap_liquidity_taproot(maker: &Maker) -> Result<(), MakerError> {
         log::info!(
             "[{}] Taproot swap liquidity: {} sats, {} ongoing swaps",
             maker.config.network_port,
-            swap_balance.to_sat(),
+            offer_max_size,
             ongoing_swaps_count
         );
     }
@@ -506,11 +507,7 @@ fn handle_client_taproot(maker: &Arc<Maker>, stream: &mut TcpStream) -> Result<(
         );
         let message = match serde_cbor::from_slice::<TakerToMakerMessage>(&message_bytes) {
             Ok(msg) => {
-                log::debug!(
-                    "[{}] Successfully decoded message: {:?}",
-                    maker.config.network_port,
-                    msg
-                );
+                log::info!("[{}] <=== {}", maker.config.network_port, msg);
                 msg
             }
             Err(e) => {
@@ -602,7 +599,7 @@ fn handle_client_taproot(maker: &Arc<Maker>, stream: &mut TcpStream) -> Result<(
         }
         // Send response if we have one (only applies to taker messages)
         if let Some(response_msg) = response {
-            log::info!("[{}] Sending response", maker.config.network_port,);
+            log::info!("[{}] ===> {}", maker.config.network_port, response_msg);
 
             if let Err(e) = send_message(stream, &response_msg) {
                 log::error!(
@@ -784,8 +781,6 @@ pub fn start_maker_server_taproot(maker: Arc<Maker>) -> Result<(), MakerError> {
     while !maker.shutdown.load(Relaxed) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                log::info!("[{network_port}] Received incoming connection");
-
                 if let Err(e) = handle_client_taproot(&maker, &mut stream) {
                     log::error!("[{network_port}] Error Handling client request {e:?}");
                 }
