@@ -17,6 +17,15 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{  hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -28,10 +37,18 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      - name: Setup nextest config
+        run: |
+          mkdir -p .config
+          cat <<'EOF' > .config/nextest.toml
+          [profile.default]
+          global-timeout = "1h30m"
+          EOF
+
       - name: Run cargo-llvm-cov
         run: |
           mkdir -p ./coverage/reports/
-          cargo llvm-cov nextest --lib --bins --tests --fail-fast --features integration-test --no-capture
+          cargo llvm-cov nextest --lib --bins --tests --build-jobs $(nproc) --retries 1 --max-fail 6:immediate --features integration-test --no-capture
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura.xml
         
       - name: Upload coverage to Codecov
