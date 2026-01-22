@@ -2,17 +2,18 @@ on:
   push:
     branches:
       - master
+      - ci-5-parallel
   pull_request:
 
 name: test
 
 jobs:
   test_with_codecov:
-    name: Run tests coverage (Partition ${{ matrix.partition }}/5)
+    name: Run tests coverage (Partition ${{ matrix.partition }}/8)
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        partition: [1, 2, 3, 4, 5]
+        partition: [1,2,3,4,5,6,7,8]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,7 +53,7 @@ jobs:
       - name: Run cargo-llvm-cov
         run: |
           mkdir -p ./coverage/reports/
-          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 5:immediate --partition hash:${{ matrix.partition }}/5 --features integration-test --no-capture
+          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 5:immediate --partition hash:${{ matrix.partition }}/8 --features integration-test --no-capture
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
 
       - name: Upload coverage to Codecov
