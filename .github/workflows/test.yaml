@@ -9,11 +9,11 @@ name: test
 
 jobs:
   test_with_codecov:
-    name: Run tests coverage (Partition ${{ matrix.partition }}/8)
+    name: Run tests coverage (Partition ${{ matrix.partition }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        partition: [1,2,3,4,5,6,7,8]
+        partition: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,7 +53,7 @@ jobs:
       - name: Run cargo-llvm-cov
         run: |
           mkdir -p ./coverage/reports/
-          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 5:immediate --partition hash:${{ matrix.partition }}/8 --features integration-test --no-capture
+          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 5:immediate --partition hash:${{ matrix.partition }}/${{ strategy.job-total }} --features integration-test --no-capture
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
 
       - name: Upload coverage to Codecov
