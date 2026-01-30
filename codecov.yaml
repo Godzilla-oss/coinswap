@@ -1,14 +1,8 @@
 codecov:
   notify:
-<<<<<<< HEAD
-    after_n_builds: 2
-comment:
-  after_n_builds: 2
-=======
     after_n_builds: 10
 comment:
   after_n_builds: 10
->>>>>>> 7098f96 (CI improvements)
 coverage:
   status:
     project:

@@ -12,14 +12,9 @@ jobs:
     name: Run tests coverage (Partition ${{ matrix.partition }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
     strategy:
-<<<<<<< HEAD
-      matrix:
-        partition: [1, 2, 3, 4]
-=======
       fail-fast: false
       matrix:
         partition: [1,2,3,4,5,6,7,8,9,10]
->>>>>>> 7098f96 (CI improvements)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,22 +47,14 @@ jobs:
           mkdir -p .config
           cat <<'EOF' > .config/nextest.toml
           [profile.default]
-<<<<<<< HEAD
-          global-timeout = "1h30m"
-=======
           global-timeout = "1h"
->>>>>>> 7098f96 (CI improvements)
           slow-timeout = "3m"
           EOF
 
       - name: Run cargo-llvm-cov
         run: |
           mkdir -p ./coverage/reports/
-<<<<<<< HEAD
-          cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 5:immediate --partition hash:${{ matrix.partition }}/${{ strategy.job-total }} --features integration-test --no-capture
-=======
           cargo llvm-cov nextest --lib --bins --tests --retries 1 --max-fail 2:immediate --partition hash:${{ matrix.partition }}/${{strategy.job-total}} --features integration-test --no-capture
->>>>>>> 7098f96 (CI improvements)
           cargo llvm-cov report --cobertura --output-path ./coverage/reports/cobertura-${{ strategy.job-index }}.xml
 
       - name: Upload coverage to Codecov
