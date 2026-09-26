@@ -2552,6 +2552,15 @@ impl Wallet {
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
     ) -> Result<Vec<(ListUnspentResultEntry, UTXOSpendInfo)>, WalletError> {
+        // `target + fee` below is plain u64 arithmetic, so an amount near the
+        // top of the range wraps in release and panics in debug, leaving the
+        // wallet lock poisoned for every later call.
+        if amount > Amount::MAX_MONEY {
+            return Err(WalletError::General(
+                "Amount is above the 21M BTC cap".to_string(),
+            ));
+        }
+
         const LONG_TERM_FEERATE: f32 = 10.0;
         // (version 4 + input varint 1 + output varint 1 + locktime 4) * 4 + marker 1 + flag 1 = 42 WU
         const BASE_TXN_ONLY_WEIGHT: u64 = 42;
@@ -4096,6 +4105,52 @@ pub(crate) mod test_support {
             locked_utxos: HashSet::new(),
             restore_scan: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod coin_select_cap_tests {
+    use super::{test_support::test_wallet, *};
+    use crate::utill::MIN_RELAY_FEE_RATE;
+    use bitcoind::tempfile::tempdir;
+
+    #[test]
+    fn coin_select_rejects_amounts_above_the_cap() {
+        let dir = tempdir().unwrap();
+        let wallet = test_wallet(&dir.path().join("cap-test-wallet"));
+
+        // `target + fee` inside coin_select is plain u64 arithmetic.
+        for amount in [
+            Amount::from_sat(u64::MAX),
+            Amount::MAX_MONEY + Amount::ONE_SAT,
+        ] {
+            let err = wallet
+                .coin_select(amount, MIN_RELAY_FEE_RATE, AddressType::P2WPKH, None, None)
+                .unwrap_err();
+            assert!(
+                format!("{:?}", err).contains("21M"),
+                "{} sats must trip the cap: {:?}",
+                amount.to_sat(),
+                err
+            );
+        }
+
+        // The cap itself is spendable as far as this check is concerned, so a
+        // `>=` here would be wrong; it fails later for want of funds.
+        let err = wallet
+            .coin_select(
+                Amount::MAX_MONEY,
+                MIN_RELAY_FEE_RATE,
+                AddressType::P2WPKH,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, WalletError::InsufficientFund { .. }),
+            "the cap itself must reach coin selection, not the guard: {:?}",
+            err
+        );
     }
 }
 
