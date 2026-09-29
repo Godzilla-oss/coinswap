@@ -238,6 +238,13 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         .then(|| maker.get_tor_hostname())
         .transpose()?;
 
+    // Before the fidelity and liquidity waits, not after: both loop until the
+    // wallet has funds, and a maker whose coins are locked in a Lightning
+    // HTLC needs the watchdog to refund them before it can ever satisfy
+    // those waits. Recovery must not depend on being ready for new swaps.
+    #[cfg(feature = "lightning")]
+    spawn_lightning_threads(&maker)?;
+
     if let Some(maker_address) = maker_address.as_ref() {
         log::info!(
             "[{}] Setting up fidelity bond...",
@@ -445,6 +452,54 @@ pub fn start_server(maker: Arc<MakerServer>) -> Result<(), MakerError> {
 ///
 /// The thread re-reads `highest_fidelity_proof` on every broadcast cycle so
 /// that bond renewals are picked up.
+/// Spawns the Lightning event pump (routes node events to per-swap
+/// mailboxes) and the swap watchdog (settles/refunds swaps whose final
+/// message never arrived). No-ops when no Lightning backend is configured.
+#[cfg(feature = "lightning")]
+fn spawn_lightning_threads(maker: &Arc<MakerServer>) -> Result<(), MakerError> {
+    let Some(router) = maker.ln_router.clone() else {
+        return Ok(());
+    };
+
+    let pump_maker = maker.clone();
+    let pump = std::thread::Builder::new()
+        .name("ln-event-pump".to_string())
+        .spawn(move || {
+            log::info!("Lightning event pump started");
+            while !pump_maker.is_shutdown() {
+                if router.pump_once() == 0 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            log::info!("Lightning event pump stopped");
+        })
+        .map_err(MakerError::IO)?;
+    maker.thread_pool.add_thread(pump)?;
+
+    let watchdog_maker = maker.clone();
+    let watchdog = std::thread::Builder::new()
+        .name("ln-watchdog".to_string())
+        .spawn(move || {
+            log::info!("Lightning swap watchdog started");
+            while watchdog_maker.wait_for_shutdown(Duration::from_secs(30)) {
+                super::lightning_handlers::ln_watchdog_tick(&watchdog_maker);
+            }
+            log::info!("Lightning swap watchdog stopped");
+        });
+    // The pump is already running and holds a MakerServer handle. If the
+    // watchdog cannot start, signal shutdown so the pump exits instead of
+    // spinning for the life of the process.
+    let watchdog = match watchdog {
+        Ok(handle) => handle,
+        Err(e) => {
+            maker.shutdown.store(true, Ordering::Relaxed);
+            return Err(MakerError::IO(e));
+        }
+    };
+    maker.thread_pool.add_thread(watchdog)?;
+    Ok(())
+}
+
 fn spawn_nostr_broadcast_thread(maker: &Arc<MakerServer>) -> Result<(), MakerError> {
     log::info!(
         "[{}] Spawning nostr background task",

@@ -248,6 +248,112 @@ pub(crate) fn send_to_address(
         .unwrap()
 }
 
+/// A throwaway regtest node that deletes its data directory when it drops.
+///
+/// Derefs to the [`BitcoinD`] so callers use it like the node itself.
+#[cfg(feature = "lightning")]
+pub(crate) struct LnRegtest {
+    node: Option<BitcoinD>,
+    dir: PathBuf,
+}
+
+#[cfg(feature = "lightning")]
+impl std::ops::Deref for LnRegtest {
+    type Target = BitcoinD;
+    fn deref(&self) -> &BitcoinD {
+        self.node.as_ref().expect("node lives until drop")
+    }
+}
+
+#[cfg(feature = "lightning")]
+impl Drop for LnRegtest {
+    fn drop(&mut self) {
+        // Stop the node first: its data directory cannot be removed from
+        // under a running process.
+        drop(self.node.take());
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Spawns a throwaway regtest bitcoind under a unique temp directory, which
+/// is removed when the returned guard drops.
+///
+/// `suite` groups a test file's data directories; `test_name` names the run.
+#[cfg(feature = "lightning")]
+pub(crate) fn setup_bitcoind(suite: &str, test_name: &str) -> LnRegtest {
+    // The unique root, not the leaf, is what gets removed: deleting only the
+    // leaf would leave an empty shell behind on every run.
+    let root = env::temp_dir().join(format!("coinswap-{}", rand::random::<u64>()));
+    let dir = root.join(suite).join(test_name);
+    let port_zmq = 28332 + rand::random::<u16>() % 20000;
+    let zmq_addr = format!("tcp://127.0.0.1:{port_zmq}");
+    let node = init_bitcoind(&dir, zmq_addr).expect("bitcoind starts");
+    LnRegtest {
+        node: Some(node),
+        dir: root,
+    }
+}
+
+/// Fetches a transaction by txid, retrying briefly: the asynchronous txindex
+/// can lag behind a freshly mined block under parallel test load.
+#[cfg(feature = "lightning")]
+pub(crate) fn raw_tx_with_retry(bitcoind: &BitcoinD, txid: &Txid) -> bitcoin::Transaction {
+    for _ in 0..50 {
+        if let Ok(tx) = bitcoind.client.get_raw_transaction(txid, None) {
+            return tx;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("transaction {} not found after retries", txid);
+}
+
+/// Funds `spk` with `amount`, mines a block and returns the confirmed
+/// funding txid, outpoint and output.
+#[cfg(feature = "lightning")]
+pub(crate) fn fund_script(
+    bitcoind: &BitcoinD,
+    spk: &bitcoin::ScriptBuf,
+    amount: Amount,
+) -> (Txid, bitcoin::OutPoint, bitcoin::TxOut) {
+    let address = bitcoin::Address::from_script(spk, bitcoin::Network::Regtest).unwrap();
+    let txid = send_to_address(bitcoind, &address, amount);
+    generate_blocks(bitcoind, 1);
+    let funding_tx = raw_tx_with_retry(bitcoind, &txid);
+    let vout = funding_tx
+        .output
+        .iter()
+        .position(|o| &o.script_pubkey == spk)
+        .expect("funding output present");
+    let outpoint = bitcoin::OutPoint {
+        txid,
+        vout: vout as u32,
+    };
+    (txid, outpoint, funding_tx.output[vout].clone())
+}
+
+/// Confirmation count for `txid`, retrying while the txindex catches up.
+#[cfg(feature = "lightning")]
+pub(crate) fn confirmations(bitcoind: &BitcoinD, txid: &Txid) -> u32 {
+    for _ in 0..50 {
+        if let Ok(info) = bitcoind.client.get_raw_transaction_info(txid, None) {
+            return info.confirmations.unwrap_or(0);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    0
+}
+
+/// A fresh address from the node's own wallet, as a spend destination.
+#[cfg(feature = "lightning")]
+pub(crate) fn miner_spk(bitcoind: &BitcoinD) -> bitcoin::ScriptBuf {
+    bitcoind
+        .client
+        .get_new_address(None, None)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+}
+
 /// Wait for all makers to complete setup, with a timeout.
 ///
 /// Panics if any maker's `is_setup_complete` flag doesn't become true within `timeout_secs`.
@@ -925,6 +1031,8 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             false,
+            #[cfg(feature = "lightning")]
+            Vec::new(),
         )
     }
 
@@ -943,6 +1051,8 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             true,
+            #[cfg(feature = "lightning")]
+            Vec::new(),
         )
     }
 
@@ -962,6 +1072,8 @@ impl TestFramework {
             taker_behavior,
             maker_behaviors,
             false,
+            #[cfg(feature = "lightning")]
+            Vec::new(),
         )
     }
 
@@ -972,6 +1084,9 @@ impl TestFramework {
         taker_behavior: Vec<TakerBehavior>,
         maker_behaviors: Vec<MakerBehavior>,
         check_blocklist: bool,
+        #[cfg(feature = "lightning")] maker_lightning: Vec<
+            std::sync::Arc<dyn openswap::lightning::LightningBackend>,
+        >,
     ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
         assert_eq!(
             fee_overrides.len(),
@@ -985,7 +1100,14 @@ impl TestFramework {
         if temp_dir.exists() {
             fs::remove_dir_all::<PathBuf>(temp_dir.clone()).unwrap();
         }
-        setup_logger(log::LevelFilter::Debug, Some(temp_dir.clone()));
+        // Debug by default; override with e.g. OPENSWAP_TEST_LOG=warn (or
+        // `off`). Applies to both stdout (visible with --nocapture) and the
+        // debug.log files under the test's temp dir.
+        let log_level = env::var("OPENSWAP_TEST_LOG")
+            .ok()
+            .and_then(|level| level.parse().ok())
+            .unwrap_or(log::LevelFilter::Debug);
+        setup_logger(log_level, Some(temp_dir.clone()));
         log::info!("📁 temporary directory : {}", temp_dir.display());
         let (bitcoind, zmq_addr) = (0..3)
             .find_map(|_| {
@@ -1102,6 +1224,10 @@ impl TestFramework {
                     server.behavior = maker_behaviors.get(i).copied().unwrap_or_default();
                     *server.reserved_network_listener.lock().unwrap() = Some(network_listener);
                     *server.reserved_rpc_listener.lock().unwrap() = Some(rpc_listener);
+                    #[cfg(feature = "lightning")]
+                    if let Some(backend) = maker_lightning.get(i).cloned() {
+                        server.set_lightning_backend(backend);
+                    }
                     Arc::new(server)
                 })
                 .collect();
@@ -1146,6 +1272,26 @@ impl TestFramework {
         });
         log::info!("✅ Test Framework initialization complete");
         (framework, takers, makers, generate_blocks_handle)
+    }
+
+    /// [`TestFramework::init`] with a Lightning backend handed to each maker,
+    /// `maker_lightning[i]` going to the maker at index `i`.
+    #[allow(clippy::type_complexity)]
+    #[cfg(feature = "lightning")]
+    pub fn init_with_lightning<B: TestBackend>(
+        maker_count: usize,
+        taker_behavior: Vec<TakerBehavior>,
+        maker_behaviors: Vec<MakerBehavior>,
+        maker_lightning: Vec<std::sync::Arc<dyn openswap::lightning::LightningBackend>>,
+    ) -> (Arc<Self>, Vec<Taker>, Vec<Arc<MakerServer>>, JoinHandle<()>) {
+        Self::init_with_settings::<B>(
+            vec![(0, None); maker_count],
+            vec![None; maker_count],
+            taker_behavior,
+            maker_behaviors,
+            false,
+            maker_lightning,
+        )
     }
 
     /// Rebuild taker `i`'s init config, so a test can drop the taker and re-init

@@ -180,6 +180,12 @@ pub struct TakerInitConfig {
     pub connection_type: ConnectionType,
     /// Nostr relay URLs for maker discovery.
     pub nostr_relays: Vec<String>,
+    /// LDK Server gRPC address (`host:port`, no scheme) for Lightning swaps.
+    pub ldk_server_url: Option<String>,
+    /// Path to the LDK Server API key file.
+    pub ldk_api_key_path: Option<String>,
+    /// Path to the LDK Server TLS certificate.
+    pub ldk_tls_cert_path: Option<String>,
 }
 
 impl Default for TakerInitConfig {
@@ -195,6 +201,9 @@ impl Default for TakerInitConfig {
             password: None,
             connection_type: ConnectionType::Tor,
             nostr_relays: NOSTR_RELAYS.iter().map(|s| s.to_string()).collect(),
+            ldk_server_url: None,
+            ldk_api_key_path: None,
+            ldk_tls_cert_path: None,
         }
     }
 }
@@ -533,6 +542,9 @@ pub struct Taker {
     recovery_loop: Option<RecoveryLoop>,
     /// Breach detector for legacy swaps (monitors funding outpoints for adversarial contract broadcasts).
     pub(crate) breach_detector: Option<BreachDetector>,
+    /// Lightning backend for submarine swaps, when configured.
+    #[cfg(feature = "lightning")]
+    pub(crate) lightning: Option<Arc<dyn crate::lightning::LightningBackend>>,
     /// Test behavior.
     #[cfg(feature = "integration-test")]
     pub behavior: TakerBehavior,
@@ -725,9 +737,19 @@ impl Taker {
             swap_tracker,
             recovery_loop: None,
             breach_detector: None,
+            #[cfg(feature = "lightning")]
+            lightning: None,
             #[cfg(feature = "integration-test")]
             behavior: TakerBehavior::Normal,
         };
+        #[cfg(feature = "lightning")]
+        {
+            let network = taker
+                .read_wallet()
+                .map(|wallet| wallet.store.network)
+                .unwrap_or(bitcoin::Network::Bitcoin);
+            taker.lightning = super::lightning_swap::init_lightning_backend(&taker.config, network);
+        }
 
         taker.init_recover_wallet();
         Ok(taker)
@@ -877,6 +899,22 @@ impl Taker {
 
         if let Some(check_blocklist) = config.check_blocklist {
             taker_config.check_blocklist = check_blocklist;
+        }
+
+        // Carried across the rewrite like every other setting above: the CLI
+        // rebuilds `TakerInitConfig` from this file on the next launch, so
+        // dropping these would silently disable the Lightning backend — and
+        // with it the automatic recovery of any swap still in flight.
+        if config.ldk_server_url.is_some() {
+            taker_config.ldk_server_url = config.ldk_server_url.clone();
+        }
+
+        if config.ldk_api_key_path.is_some() {
+            taker_config.ldk_api_key_path = config.ldk_api_key_path.clone();
+        }
+
+        if config.ldk_tls_cert_path.is_some() {
+            taker_config.ldk_tls_cert_path = config.ldk_tls_cert_path.clone();
         }
 
         #[cfg(not(feature = "integration-test"))]
@@ -3363,9 +3401,7 @@ impl Taker {
                 .first()
                 .and_then(|sc| sc.swap_id.clone())
                 .or_else(|| incoming.first().and_then(|sc| sc.swap_id.clone()))
-                .ok_or_else(|| {
-                    TakerError::General("No persisted swapcoins found for recovery".to_string())
-                })?
+                .ok_or(TakerError::NothingToRecover)?
         };
 
         lock_debug!(self.swap_tracker.lock())
@@ -3785,4 +3821,47 @@ pub enum TakerBehavior {
     /// Skew one funding split a sat below the contract floor while keeping the
     /// count and total exact (maker per-contract floor rejection tests).
     SkewSplitBelowFloor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CLI rebuilds `TakerInitConfig` from `config.toml` on every launch,
+    /// so anything `init_taker_config` fails to write is lost at the next
+    /// start. For the Lightning settings that would mean a taker restarting
+    /// without a backend, unable to recover a swap still in flight.
+    #[test]
+    fn init_taker_config_persists_lightning_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "taker-init-config-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = TakerInitConfig {
+            connection_type: ConnectionType::Clearnet,
+            ldk_server_url: Some("127.0.0.1:3537".to_string()),
+            ldk_api_key_path: Some("/tmp/ldk2/api_key".to_string()),
+            ldk_tls_cert_path: Some("/tmp/ldk2/tls.crt".to_string()),
+            ..TakerInitConfig::default()
+        };
+
+        Taker::init_taker_config(&config, &dir).unwrap();
+
+        // Reloaded the way the CLI does on the next launch.
+        let reloaded = TakerConfig::new(Some(&dir.join("config.toml"))).unwrap();
+        assert_eq!(reloaded.ldk_server_url.as_deref(), Some("127.0.0.1:3537"));
+        assert_eq!(
+            reloaded.ldk_api_key_path.as_deref(),
+            Some("/tmp/ldk2/api_key")
+        );
+        assert_eq!(
+            reloaded.ldk_tls_cert_path.as_deref(),
+            Some("/tmp/ldk2/tls.crt")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

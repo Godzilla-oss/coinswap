@@ -349,6 +349,13 @@ pub trait Maker: Send + Sync {
     /// Get maker configuration values.
     fn get_config(&self) -> MakerConfig;
 
+    /// Lightning submarine-swap terms, when a Lightning backend is
+    /// configured and reachable. Deliberately kept off [`MakerConfig`]:
+    /// `get_config` runs on every coinswap message, and deriving these
+    /// terms costs a round-trip to the Lightning sidecar. On-chain swaps
+    /// must not wait on a service they do not use.
+    fn lightning_offer(&self) -> Option<crate::protocol::lightning_messages::LightningOffer>;
+
     /// Validate swap parameters.
     fn validate_swap_parameters(&self, details: &SwapDetails) -> Result<u16, MakerError>;
 
@@ -533,6 +540,130 @@ pub trait Maker: Send + Sync {
     /// Get the test behavior override.
     #[cfg(feature = "integration-test")]
     fn behavior(&self) -> MakerBehavior;
+
+    /// The Lightning backend, when configured. Default: none, which makes
+    /// every Lightning request answer `Unsupported`.
+    #[cfg(feature = "lightning")]
+    fn lightning(&self) -> Option<std::sync::Arc<dyn crate::lightning::LightningBackend>> {
+        None
+    }
+
+    /// The Lightning event router, when a backend is configured.
+    #[cfg(feature = "lightning")]
+    fn ln_router(&self) -> Option<std::sync::Arc<super::lightning_handlers::LnEventRouter>> {
+        None
+    }
+
+    /// Store per-swap Lightning state.
+    #[cfg(feature = "lightning")]
+    fn store_ln_swap(
+        &self,
+        _swap_id: &str,
+        _swap: super::lightning_handlers::LnMakerSwap,
+    ) -> Result<(), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Retrieve per-swap Lightning state.
+    #[cfg(feature = "lightning")]
+    fn get_ln_swap(
+        &self,
+        _swap_id: &str,
+    ) -> Result<Option<super::lightning_handlers::LnMakerSwap>, MakerError> {
+        Ok(None)
+    }
+
+    /// Remove per-swap Lightning state.
+    #[cfg(feature = "lightning")]
+    fn remove_ln_swap(&self, _swap_id: &str) -> Result<(), MakerError> {
+        Ok(())
+    }
+
+    /// How many Lightning swaps are currently in flight.
+    #[cfg(feature = "lightning")]
+    fn ln_swap_count(&self) -> usize {
+        0
+    }
+
+    /// Whether this specific transaction is confirmed.
+    ///
+    /// Distinguishing *which* transaction spent an HTLC needs this: knowing
+    /// the outpoint has some confirmed spend does not say whose it was.
+    #[cfg(feature = "lightning")]
+    fn is_tx_confirmed(&self, _txid: &bitcoin::Txid) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Whether `outpoint` has a *confirmed* spend. A mempool-only spend
+    /// reports false: it can still be evicted or reorged away, and dropping
+    /// a swap's record on one would discard the only key that reaches the
+    /// HTLC.
+    #[cfg(feature = "lightning")]
+    fn is_htlc_spend_confirmed(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+        _script: &bitcoin::ScriptBuf,
+    ) -> Result<bool, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Whether `outpoint` is still unspent (mempool included), and how many
+    /// blocks have passed since its transaction confirmed.
+    ///
+    /// A swap-in maker must know both before it pays: an already-spent
+    /// output, or one whose CSV window has largely elapsed, means the taker
+    /// can refund the HTLC the maker is about to pay for.
+    #[cfg(feature = "lightning")]
+    fn htlc_unspent_and_age(
+        &self,
+        _outpoint: &bitcoin::OutPoint,
+    ) -> Result<(bool, u32), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Waits for a Lightning HTLC funding transaction to reach
+    /// `required_confirms`.
+    ///
+    /// Separate from [`wait_for_txs_on_chain`](Self::wait_for_txs_on_chain),
+    /// whose keep-alive hook aborts the wait for any swap missing from
+    /// `ongoing_swaps` — which every Lightning swap is, being tracked in its
+    /// own map.
+    #[cfg(feature = "lightning")]
+    fn wait_for_htlc_confirmation(
+        &self,
+        _txid: &bitcoin::Txid,
+        _required_confirms: u32,
+    ) -> Result<(), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Funds `address` with exactly `amount` for a Lightning HTLC, returning
+    /// the transaction and the output's index.
+    ///
+    /// Separate from the coinswap funding path, which executes a plan frozen
+    /// at admission: a Lightning HTLC is one exact output with no hop to
+    /// reimburse, and its swap never enters `ongoing_swaps`.
+    #[cfg(feature = "lightning")]
+    fn fund_htlc(
+        &self,
+        _swap_id: &str,
+        _amount: Amount,
+        _address: bitcoin::Address,
+    ) -> Result<(Transaction, u32), MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// A fresh wallet receive address (Lightning HTLC sweeps/refunds land here).
+    #[cfg(feature = "lightning")]
+    fn get_receive_address(&self) -> Result<bitcoin::Address, MakerError> {
+        Err(MakerError::General("lightning swaps not supported"))
+    }
+
+    /// Whether server shutdown was requested; bounds blocking waits.
+    #[cfg(feature = "lightning")]
+    fn shutdown_requested(&self) -> bool {
+        false
+    }
 }
 
 pub(super) fn emit_maker_success_report<M: Maker>(
@@ -757,6 +888,37 @@ pub fn handle_message<M: Maker>(
             state.touch();
             Ok(None)
         }
+        TakerToMakerMessage::Lightning(ln_msg) => {
+            #[cfg(feature = "lightning")]
+            {
+                super::lightning_handlers::handle_lightning_message(maker, state, *ln_msg)
+            }
+            #[cfg(not(feature = "lightning"))]
+            {
+                // Decline gracefully: a dropped connection would leave the
+                // taker unable to distinguish "unsupported" from "down".
+                log::info!(
+                    "[{}] Declining Lightning message {} (built without lightning support)",
+                    maker.network_port(),
+                    ln_msg
+                );
+                Ok(Some(MakerToTakerMessage::Unsupported(
+                    crate::protocol::common_messages::UnsupportedMessage {
+                        what: "Lightning".to_string(),
+                        reason: "maker built without lightning support".to_string(),
+                    },
+                )))
+            }
+        }
+        TakerToMakerMessage::Unsupported(unsupported) => {
+            log::warn!(
+                "[{}] Peer declined {}: {}",
+                maker.network_port(),
+                unsupported.what,
+                unsupported.reason
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -818,6 +980,9 @@ fn handle_get_offer<M: Maker>(
         fidelity,
         tweak_chain_code,
         name: config.name,
+        // Fetched here rather than through `get_config`: this is one of the
+        // two places that actually needs it.
+        lightning: maker.lightning_offer(),
     };
 
     #[cfg(feature = "integration-test")]

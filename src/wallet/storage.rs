@@ -218,6 +218,139 @@ pub(crate) struct WalletStore {
     /// swap, so one swap's release must never free another's inputs.
     #[serde(default)]
     pub(crate) swap_locks: HashMap<String, SwapReservation>,
+
+    /// Pending Lightning submarine swaps by swap_id (hex payment hash).
+    /// Everything needed to claim or refund the on-chain HTLC after a crash.
+    #[serde(default)]
+    pub(crate) ln_pending_swaps: HashMap<String, LnPendingSwap>,
+
+    /// Maker-side Lightning swaps in progress, by swap_id. Restored into the
+    /// maker's live swap map on startup so a restart mid-swap can still
+    /// sweep or refund.
+    #[serde(default)]
+    pub(crate) ln_maker_swaps: HashMap<String, LnMakerSwapRecord>,
+}
+
+/// Which side of a Lightning swap the maker is serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LnMakerDirection {
+    /// Taker pays on-chain, maker pays over Lightning.
+    SwapIn,
+    /// Taker pays over Lightning, maker pays on-chain.
+    SwapOut,
+}
+
+/// How far a maker-side Lightning swap has progressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LnMakerPhase {
+    /// Swap-in accepted; awaiting the taker's HTLC funding announcement.
+    InAccepted,
+    /// Swap-in invoice paid; awaiting the settlement that reveals the
+    /// preimage, then an on-chain sweep.
+    InPaid,
+    /// Swap-in sweep broadcast, awaiting confirmation. The record is kept
+    /// until then so the sweep can be rebuilt and rebroadcast: a spend that
+    /// is only in the mempool can still be evicted or reorged away.
+    InSwept,
+    /// Swap-out accepted (hold invoice created); awaiting payment.
+    OutAccepted,
+    /// Swap-out HTLC funded on-chain; awaiting the taker's claim.
+    OutFunded,
+}
+
+/// Maker-side recovery record for a Lightning submarine swap.
+///
+/// Written before the maker commits anything of value — before paying an
+/// invoice, before funding an HTLC — so a maker that restarts mid-swap can
+/// still reach the money. Without it a restarted swap-in maker cannot sweep
+/// the HTLC it already paid for, and a restarted swap-out maker cannot
+/// refund the HTLC it already funded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LnMakerSwapRecord {
+    /// Direction of the swap.
+    pub direction: LnMakerDirection,
+    /// Current phase.
+    pub phase: LnMakerPhase,
+    /// Lightning payment hash (the swap id in hex).
+    pub payment_hash: bitcoin::hashes::sha256::Hash,
+    /// Swap amount (what the taker receives).
+    pub amount: bitcoin::Amount,
+    /// Maker fee on top of `amount`.
+    pub fee: bitcoin::Amount,
+    /// Relative locktime (blocks, CSV) of the refund branch.
+    pub locktime: u16,
+    /// Confirmations required on the HTLC funding output.
+    pub min_confirmations: u32,
+    /// The HTLC witness script.
+    pub redeemscript: ScriptBuf,
+    /// The maker's branch key: hashlock (swap-in) or timelock (swap-out).
+    pub privkey: bitcoin::secp256k1::SecretKey,
+    /// The invoice: the taker's hold invoice (swap-in) or ours (swap-out).
+    pub invoice: String,
+    /// The swap preimage, once the maker has learned it. Kept so a sweep
+    /// can be rebuilt after a restart or an evicted broadcast.
+    #[serde(default)]
+    pub preimage: Option<[u8; 32]>,
+    /// Txid of the refund this maker broadcast, once it has. Lets a
+    /// confirmed spend of the HTLC be attributed: only if *this*
+    /// transaction confirmed was the refund ours.
+    #[serde(default)]
+    pub refund_txid: Option<bitcoin::Txid>,
+    /// Chain tip when this swap was accepted. A swap-in's funding deadline
+    /// is measured in blocks from here, since the taker must wait for the
+    /// confirmations the maker demanded before it can announce.
+    #[serde(default)]
+    pub accepted_height: Option<u32>,
+    /// Where this swap's sweep or refund pays out. Fixed on first use so a
+    /// rebuild produces the same transaction instead of one that conflicts
+    /// with what is already in the mempool — and so retrying does not
+    /// consume a fresh address every tick.
+    #[serde(default)]
+    pub payout_script: Option<ScriptBuf>,
+    /// The HTLC funding outpoint, once known.
+    pub funding_outpoint: Option<OutPoint>,
+    /// The HTLC funding value, once known.
+    pub funding_value: Option<bitcoin::Amount>,
+    /// Block height when the funding was first seen (refund timing).
+    pub funding_height: Option<u32>,
+}
+
+/// Taker-side recovery record for a Lightning submarine swap.
+///
+/// Persisted (encrypted with the rest of the store) before any value is
+/// committed, so a crashed taker can always claim (preimage present) or
+/// refund (timelock branch) the on-chain HTLC.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct LnPendingSwap {
+    /// Whether this is a swap-in (`true`: we funded, refund branch is ours)
+    /// or a swap-out (`false`: we claim via hashlock with the preimage).
+    pub is_swap_in: bool,
+    /// The swap preimage; only for swap-outs (we generated it).
+    pub preimage: Option<[u8; 32]>,
+    /// The HTLC witness script.
+    pub redeemscript: ScriptBuf,
+    /// Relative locktime (blocks, CSV) of the refund branch.
+    pub locktime: u16,
+    /// Our branch key: timelock (swap-in) or hashlock (swap-out).
+    pub privkey: bitcoin::secp256k1::SecretKey,
+    /// The HTLC funding outpoint, once known.
+    pub outpoint: Option<OutPoint>,
+    /// The HTLC funding value, once known.
+    pub value: Option<bitcoin::Amount>,
+}
+
+/// Redacted: the preimage is the secret the whole swap turns on, and
+/// `Wallet` formats its store.
+impl std::fmt::Debug for LnPendingSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LnPendingSwap")
+            .field("is_swap_in", &self.is_swap_in)
+            .field("preimage", &self.preimage.map(|_| "<redacted>"))
+            .field("locktime", &self.locktime)
+            .field("outpoint", &self.outpoint)
+            .field("value", &self.value)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WalletStore {
@@ -250,6 +383,8 @@ impl WalletStore {
             wallet_birthday,
             utxo_cache: HashMap::new(),
             swap_locks: HashMap::new(),
+            ln_pending_swaps: HashMap::new(),
+            ln_maker_swaps: HashMap::new(),
         };
         store.master_key.seal(store_enc_material)?;
 
