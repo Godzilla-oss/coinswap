@@ -866,25 +866,32 @@ fn process_req_contract_sigs_for_recvr<M: Maker>(
             ));
         }
 
-        if let Some(outgoing) = maker.find_outgoing_swapcoin(&txinfo.multisig_redeemscript) {
-            // Verify the contract tx spends from our funding tx
-            if let Some(ref funding_tx) = outgoing.funding_tx {
-                let expected_txid = funding_tx.compute_txid();
-                let actual_txid = txinfo.contract_tx.input[0].previous_output.txid;
-                if actual_txid != expected_txid {
-                    return Err(MakerError::General(
-                        format!(
-                            "Receiver contract tx {} spends from {} but expected {}",
-                            i, actual_txid, expected_txid
-                        )
-                        .leak(),
-                    ));
-                }
+        // Only this swap's outgoing coins.
+        let outgoing = state.outgoing_swapcoins.iter().find(|outgoing| {
+            outgoing.protocol == ProtocolVersion::Legacy
+                && matches!(
+                    (&outgoing.my_pubkey, &outgoing.other_pubkey),
+                    (Some(my_pubkey), Some(other_pubkey))
+                        if create_multisig_redeemscript(my_pubkey, other_pubkey)
+                            == txinfo.multisig_redeemscript
+                )
+        });
+
+        if let Some(outgoing) = outgoing {
+            // Sign only the contract we built.
+            if txinfo.contract_tx != outgoing.contract_tx {
+                return Err(MakerError::General(
+                    format!(
+                        "Receiver contract tx {} does not match our outgoing contract",
+                        i
+                    )
+                    .leak(),
+                ));
             }
 
             if let Some(privkey) = outgoing.my_privkey {
                 match crate::protocol::contract::sign_contract_tx(
-                    &txinfo.contract_tx,
+                    &outgoing.contract_tx,
                     &txinfo.multisig_redeemscript,
                     outgoing.funding_amount,
                     &privkey,
