@@ -375,11 +375,21 @@ impl Taker {
                     .filter_map(|sc| sc.funding_tx.as_ref().map(|tx| tx.compute_txid()))
                     .collect();
                 let required_confirms = self.swap_state()?.params.required_confirms;
-                prev_confirm_height = self.wait_for_legacy_funding_confirmation(
-                    &funding_txids,
-                    required_confirms,
-                    crate::utill::TX_BROADCAST_TIMEOUT,
-                )?;
+                // Test hook: send the proof while the funding is mempool-only.
+                #[cfg(feature = "integration-test")]
+                let skip_wait =
+                    self.behavior == super::api::TakerBehavior::ReplayLegacyProofOfFunding;
+                #[cfg(not(feature = "integration-test"))]
+                let skip_wait = false;
+                prev_confirm_height = if skip_wait {
+                    0
+                } else {
+                    self.wait_for_legacy_funding_confirmation(
+                        &funding_txids,
+                        required_confirms,
+                        crate::utill::TX_BROADCAST_TIMEOUT,
+                    )?
+                };
                 _taker_funding_confirmed = true;
                 self.swap_state_mut()?.makers[maker_idx]
                     .legacy_exchange_mut()?
@@ -678,8 +688,9 @@ impl Taker {
             // Store this maker's outgoing info for next hop
             prev_senders_info = Some(senders_contract_txs_info.clone());
 
-            // For non-first hops, the taker doesn't own these contracts — track as watch-only
-            if !is_first_peer {
+            // A maker's outgoing pays the next maker, except the last one's, which
+            // is our incoming. Track the maker-to-maker ones as watch-only.
+            if !is_last_peer {
                 let watchonly_coins: Vec<WatchOnlySwapCoin> = senders_contract_txs_info
                     .iter()
                     .map(|info| {
@@ -917,7 +928,11 @@ impl Taker {
         required_confirms: u32,
         arrival_timeout: Duration,
     ) -> Result<u32, TakerError> {
-        if required_confirms == 0 || funding_txids.is_empty() {
+        #[cfg(feature = "integration-test")]
+        if self.behavior == super::api::TakerBehavior::SkipFundingConfirmWait {
+            return Ok(0);
+        }
+        if funding_txids.is_empty() {
             return Ok(0);
         }
 

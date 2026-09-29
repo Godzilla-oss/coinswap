@@ -12,8 +12,8 @@ use std::{
 
 pub(crate) use super::swap_tracker::SwapPhase;
 use super::swap_tracker::{
-    funding_shared, now_secs, ContractOutcome, ContractResolution, ExchangeProgress,
-    FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
+    funding_shared, incoming_claimed, now_secs, ContractOutcome, ContractResolution,
+    ExchangeProgress, FinalizationProgress, LegacyExchangeProgress, MakerProgress, RecoveryState,
     SerializableSecretKey, SwapRecord, SwapTracker, TaprootExchangeProgress,
 };
 
@@ -239,7 +239,8 @@ pub struct SwapParams {
     /// Swap feerate in sats/vB for every transaction in this swap. Defaults
     /// to the 1 sat/vB relay floor; lower values are rejected at prepare time.
     pub feerate: u64,
-    /// Required confirmations for funding transactions.
+    /// Required confirmations for funding transactions. At least 1:
+    /// `prepare_swap` rejects 0.
     pub required_confirms: u32,
     /// User-selected UTXOs (optional).
     pub manually_selected_outpoints: Option<Vec<OutPoint>>,
@@ -735,8 +736,8 @@ impl Taker {
     /// Called on startup to recover funds from incomplete swaps.
     ///
     /// Sweeps incoming swapcoins (hashlock path), recovers timelocked outgoing
-    /// swapcoins, and spawns a background RecoveryLoop for any remaining
-    /// unresolved contracts.
+    /// swapcoins, and spawns the background RecoveryLoop that finishes each
+    /// failed swap.
     fn init_recover_wallet(&mut self) {
         log::info!("Checking wallet for unresolved swap contracts...");
 
@@ -752,9 +753,8 @@ impl Taker {
             return;
         }
 
-        // One connection serves both startup recovery passes; the sweep and
-        // timelock recovery each take the lock themselves and drop it across
-        // their waits, so a stuck counterparty tx cannot wedge taker startup.
+        // Recovery takes the wallet lock itself and drops it across its wait,
+        // so a stuck counterparty tx cannot wedge taker startup.
         let chain = match self.read_wallet() {
             Ok(w) => match w.blockchain.new_connection() {
                 Ok(chain) => Some(chain),
@@ -770,75 +770,55 @@ impl Taker {
         };
 
         if let Some(chain) = &chain {
-            match Wallet::sweep_incoming_swapcoins(
+            match Wallet::recover_swapcoins(
                 &self.wallet,
                 chain,
                 &crate::utill::NO_SHUTDOWN,
-                Some(&incoming_contract_txids),
-            ) {
-                Ok(ref swept) if !swept.is_empty() => {
-                    log::info!(
-                        "Startup recovery: swept {} incoming swapcoins",
-                        swept.resolved.len()
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("Startup incoming sweep failed: {:?}", e),
-            }
-
-            // Wallet-driven recovery: recover timelocked. Also takes the lock itself.
-            match Wallet::recover_timelocked_swapcoins(
-                &self.wallet,
-                chain,
-                &crate::utill::NO_SHUTDOWN,
-                Some(&swap_ids),
+                &incoming_contract_txids,
+                &swap_ids,
                 &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
+                &|swap_id| incoming_claimed(&self.swap_tracker, &self.wallet, swap_id),
             ) {
-                Ok(ref recovered) if !recovered.is_empty() => {
+                Ok((swept, recovered)) if !swept.is_empty() || !recovered.is_empty() => {
                     log::info!(
-                        "Startup recovery: recovered {} timelocked outgoing swapcoins",
+                        "Startup recovery: swept {} incoming, recovered {} timelocked outgoing swapcoins",
+                        swept.resolved.len(),
                         recovered.len()
                     );
+                    // Reports need these outcomes, and later passes read the claims back.
+                    if let Ok(mut tracker) = lock_debug!(self.swap_tracker.lock()) {
+                        RecoveryLoop::update_tracker_outcomes(
+                            &mut tracker,
+                            &swap_ids,
+                            &swept,
+                            &recovered,
+                        );
+                    }
                 }
                 Ok(_) => {}
-                Err(e) => log::warn!("Startup timelock recovery failed: {:?}", e),
+                Err(e) => log::warn!("Startup recovery failed: {:?}", e),
             }
         }
 
-        let has_remaining = match self.read_wallet() {
-            Ok(wallet) => {
-                !wallet
-                    .outgoing_contract_outpoints(Some(&swap_ids))
-                    .is_empty()
-                    || !wallet
-                        .incoming_contract_outpoints(Some(&swap_ids))
-                        .is_empty()
-            }
+        // Always start the loop: with nothing left, its first pass still marks
+        // the swaps cleaned up and writes their reports, so restarts stop retrying.
+        let data_dir = match self
+            .config
+            .data_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(get_taker_dir)
+        {
+            Ok(dir) => dir,
             Err(e) => {
-                log::warn!("Startup recovery: failed to lock wallet: {:?}", e);
-                false
+                log::warn!("Startup recovery: {e}; skipping recovery loop");
+                return;
             }
         };
-
-        if has_remaining {
-            let data_dir = match self
-                .config
-                .data_dir
-                .clone()
-                .map(Ok)
-                .unwrap_or_else(get_taker_dir)
-            {
-                Ok(dir) => dir,
-                Err(e) => {
-                    log::warn!("Startup recovery: {e}; skipping recovery loop");
-                    return;
-                }
-            };
-            match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
-                Ok(rl) => self.recovery_loop = Some(rl),
-                // Without the loop, remaining contracts are never swept.
-                Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
-            }
+        match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
+            Ok(rl) => self.recovery_loop = Some(rl),
+            // Without the loop, remaining contracts are never swept.
+            Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
         }
     }
 
@@ -1000,6 +980,14 @@ impl Taker {
                 "Swap feerate {} sats/vB is below the {} sats/vB relay floor",
                 params.feerate, MIN_RELAY_FEE_RATE as u64
             )));
+        }
+
+        // A 0-conf peer can replace its funding after we commit to the next
+        // step. Nothing downstream defends against that, so refuse it here.
+        if params.required_confirms == 0 {
+            return Err(TakerError::General(
+                "Required confirmations must be at least 1".to_string(),
+            ));
         }
 
         // Zero splits fund nothing; above the cap the per-split messages grow
@@ -3784,8 +3772,8 @@ pub enum TakerBehavior {
     /// connection and resend the same contract data (resume-after-partial-
     /// broadcast test). Only the maker's same-swap exemptions let this pass.
     ResumeAfterMakerDrop,
-    /// Broadcast the contract txs but skip the confirmation wait, so contract
-    /// data reaches the maker while the funding is only mempool-visible.
+    /// Broadcast the funding but skip the confirmation waits, so the swap moves
+    /// on while the funding and contracts are only mempool-visible.
     SkipFundingConfirmWait,
     /// Withhold the contract tx broadcast and skip the wait, so the maker
     /// claims funding txids no backend can see (evidence-gated keepalive).

@@ -21,7 +21,7 @@ use crate::{
     utill::{
         HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE, UNBROADCAST_DISCARD_GRACE,
     },
-    wallet::{Blockchain, RecoveryReport, Wallet},
+    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, Wallet},
 };
 
 use super::{
@@ -1203,25 +1203,26 @@ fn recover_from_swap(
         outgoing_swapcoins.len()
     );
 
-    let all_swap_contracts_resolved = || -> Result<bool, MakerError> {
-        let wallet = lock_debug!(maker.wallet.read())
-            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
-
-        let contract_txids = outgoing_swapcoins
-            .iter()
-            .map(|s| (s.contract_tx.compute_txid(), s.get_contract_output_vout()))
-            .chain(
-                incoming_swapcoins
-                    .iter()
-                    .map(|s| (s.contract_tx.compute_txid(), s.get_contract_output_vout())),
+    // The next hop claimed an outgoing contract: it has a confirmed spend other
+    // than our own timelock refund. That claim puts the preimage on chain.
+    let claimed_downstream = |chain: &AnyBlockchain| -> Result<bool, MakerError> {
+        for outgoing in &outgoing_swapcoins {
+            let outpoint = bitcoin::OutPoint::new(
+                outgoing.contract_tx.compute_txid(),
+                outgoing.get_contract_output_vout(),
             );
-
-        for (txid, vout) in contract_txids {
-            if wallet.blockchain.get_tx_out(&txid, vout, None)?.is_some() {
-                return Ok(false);
+            let Some(output) = outgoing.contract_tx.output.get(outpoint.vout as usize) else {
+                continue;
+            };
+            if chain
+                .confirmed_spending_transaction(&outpoint, &output.script_pubkey)
+                .map_err(MakerError::Wallet)?
+                .is_some_and(|tx| !outgoing.is_own_timelock_spend(&tx))
+            {
+                return Ok(true);
             }
         }
-        Ok(true)
+        Ok(false)
     };
     let all_outgoing_confirmed_settled = || -> Result<bool, MakerError> {
         if outgoing_swapcoins.is_empty() {
@@ -1292,7 +1293,18 @@ fn recover_from_swap(
         }
         Ok(true)
     };
-    let mut timelock_recovery_txids = Vec::new();
+    // A restart resumes both lists, so the reports keep txids from before it.
+    let (mut timelock_recovery_txids, mut incoming_swept_txids) =
+        lock_debug!(maker.swap_tracker.lock())
+            .map_err(|_| MakerError::MutexPossion)?
+            .get_record(&swap_id)
+            .map(|record| {
+                (
+                    record.recovery.outgoing_recovered.clone(),
+                    record.recovery.incoming_swept.clone(),
+                )
+            })
+            .unwrap_or_default();
 
     // A restart reaches here with no record: the drain that would create one
     // never ran. Create it aged from the reservation, so the unbroadcast grace
@@ -1575,7 +1587,8 @@ fn recover_from_swap(
             watchtower_down_logged = true;
         }
 
-        // Check if all incoming swapcoins now have preimages
+        // Check if all incoming swapcoins now have preimages. One already
+        // gone from the wallet was swept on an earlier pass.
         let all_preimages_known = {
             let wallet = lock_debug!(maker.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
@@ -1584,7 +1597,7 @@ fn recover_from_swap(
                 let key = incoming.contract_tx.compute_txid().to_string();
                 wallet
                     .find_incoming_swapcoin(&key)
-                    .is_some_and(|s| s.is_preimage_known())
+                    .is_none_or(|s| s.is_preimage_known())
             })
         };
 
@@ -1597,21 +1610,52 @@ fn recover_from_swap(
         // One connection per pass, shared by both recovery paths below: on Tor
         // Electrum each fresh connection costs a circuit handshake. Idle passes
         // that only poll the watchtower pay for none.
-        let chain = if (all_preimages_known && !incoming_swapcoins.is_empty())
-            || current_height >= timelock_expiry
-        {
-            Some(
-                lock_debug!(maker.wallet.read())
-                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                    .blockchain
-                    .new_connection()
-                    .map_err(MakerError::Wallet)?,
-            )
+        let chain = if all_preimages_known || current_height >= timelock_expiry {
+            // Nothing respawns this thread, so a failed connection retries. Bind
+            // it first: the wallet guard must not outlive the retry wait.
+            let connection = lock_debug!(maker.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .blockchain
+                .new_connection();
+            match connection {
+                Ok(chain) => Some(chain),
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Could not connect for recovery: {:?}; retrying recovery",
+                        maker.config.network_port,
+                        e
+                    );
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
+                    }
+                    continue;
+                }
+            }
         } else {
             None
         };
 
-        if all_preimages_known && !incoming_swapcoins.is_empty() {
+        // A crash between the hashlock sweep and its cleanup leaves no incoming
+        // coin to show the preimage, but the next hop's claim on chain still does.
+        let settled_downstream = match chain.as_ref().filter(|_| incoming_swapcoins.is_empty()) {
+            Some(chain) => match claimed_downstream(chain) {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Could not check outgoing contract spends: {:?}; retrying recovery",
+                        maker.config.network_port,
+                        e
+                    );
+                    if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
+                        break;
+                    }
+                    continue;
+                }
+            },
+            None => false,
+        };
+
+        if all_preimages_known && (!incoming_swapcoins.is_empty() || settled_downstream) {
             log::info!(
                 "[{}] All preimages known, recovering via hashlock path",
                 maker.config.network_port
@@ -1635,7 +1679,16 @@ fn recover_from_swap(
                 &maker.shutdown,
                 Some(&contract_txids),
             )
-            .map_err(MakerError::Wallet)?;
+            // Retry next pass. With the preimage known the timelock refund is never
+            // an option: a hashlock claim and a refund must not both happen.
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "[{}] Hashlock sweep failed: {:?}",
+                    maker.config.network_port,
+                    e
+                );
+                RecoveryOutcome::default()
+            });
 
             if !swept.is_empty() {
                 log::info!(
@@ -1645,12 +1698,24 @@ fn recover_from_swap(
                 );
 
                 // Tracker: HashlockRecovered
-                let swept_txids: Vec<_> = swept.resolved.iter().map(|(_, txid)| *txid).collect();
+                incoming_swept_txids.extend(swept.resolved.iter().map(|(_, txid)| *txid));
                 update_tracker(&maker, &swap_id, |r| {
-                    r.recovery.incoming_swept = swept_txids;
+                    r.recovery.incoming_swept = incoming_swept_txids.clone();
                     r.recovery.phase = MakerRecoveryPhase::HashlockRecovered;
                 });
+            }
 
+            // A contract still in the mempool is swept on a later pass, so
+            // finish only once every incoming coin has left the wallet.
+            let fully_swept = {
+                let wallet = lock_debug!(maker.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                incoming_swapcoins.iter().all(|incoming| {
+                    let key = incoming.contract_tx.compute_txid().to_string();
+                    wallet.find_incoming_swapcoin(&key).is_none()
+                })
+            };
+            if fully_swept {
                 // Clean up outgoing swapcoins — their funding was spent by
                 // someone else (hashlock), so they are no longer recoverable
                 // via timelock. Remove them from the wallet store.
@@ -1675,10 +1740,9 @@ fn recover_from_swap(
                 let network = lock_debug!(maker.wallet.read())
                     .map(|w| w.store.network.to_string())
                     .unwrap_or_default();
-                let recovery_txids: Vec<String> = swept
-                    .resolved
+                let recovery_txids: Vec<String> = incoming_swept_txids
                     .iter()
-                    .map(|(_, spending_txid)| spending_txid.to_string())
+                    .map(|spending_txid| spending_txid.to_string())
                     .collect();
                 RecoveryReport::emit_maker(
                     &maker.data_dir,
@@ -1692,10 +1756,8 @@ fn recover_from_swap(
                 maker.shutdown.store(true, Relaxed);
                 return Ok(());
             }
-        }
-
-        // --- Timelock path: reclaim outgoing after timelock expires ---
-        if current_height >= timelock_expiry {
+        } else if current_height >= timelock_expiry {
+            // --- Timelock path: reclaim outgoing after timelock expires ---
             log::info!(
                 "[{}] Timelock expired at {} (expiry={}), recovering via timelock path",
                 maker.config.network_port,
@@ -1724,7 +1786,15 @@ fn recover_from_swap(
                 // to one swap, so every coin gets the same answer.
                 &|_| legacy_funding_shared,
             )
-            .map_err(MakerError::Wallet)?;
+            // Nothing respawns this thread: a failed wait retries on the next pass.
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "[{}] Timelock recovery pass failed: {:?}",
+                    maker.config.network_port,
+                    e
+                );
+                RecoveryOutcome::default()
+            });
 
             if !recovered.is_empty() {
                 log::info!(
@@ -1733,7 +1803,7 @@ fn recover_from_swap(
                     recovered.len()
                 );
 
-                // Tracker: TimelockRecovered → Recovered + CleanedUp
+                // Tracker: TimelockRecovered
                 let recovered_txids: Vec<_> =
                     recovered.resolved.iter().map(|(_, txid)| *txid).collect();
                 timelock_recovery_txids.extend(recovered_txids.iter().copied());
@@ -1741,44 +1811,59 @@ fn recover_from_swap(
                     r.recovery.outgoing_recovered = timelock_recovery_txids.clone();
                     r.recovery.phase = MakerRecoveryPhase::TimelockRecovered;
                 });
-                // A backend that cannot answer says nothing about the contracts;
-                // ask again next pass rather than declaring the swap finished.
-                let resolved = all_swap_contracts_resolved().unwrap_or_else(|e| {
-                    log::warn!(
-                        "[{}] Could not check contract outputs: {:?}",
-                        maker.config.network_port,
-                        e
-                    );
-                    false
-                });
-                // Nothing on-chain also describes a swap that never funded, so
-                // do not call it cleaned up while the discard is still pending.
-                if resolved && !discard_pending {
-                    update_tracker(&maker, &swap_id, |r| {
-                        r.phase = MakerSwapPhase::Recovered;
-                        r.recovery.phase = MakerRecoveryPhase::CleanedUp;
-                    });
+            }
 
-                    // Emit timelock recovery reports
-                    let network = lock_debug!(maker.wallet.read())
-                        .map(|w| w.store.network.to_string())
-                        .unwrap_or_default();
-                    let recovery_txids: Vec<String> = timelock_recovery_txids
-                        .iter()
-                        .map(|spending_txid| spending_txid.to_string())
-                        .collect();
-                    RecoveryReport::emit_maker(
-                        &maker.data_dir,
-                        swap_id.clone(),
-                        network.clone(),
-                        "timelock".to_string(),
-                        recovery_txids,
-                    );
-
-                    #[cfg(feature = "integration-test")]
-                    maker.shutdown.store(true, Relaxed);
-                    return Ok(());
+            // With every outgoing refunded or discarded, no hashlock spend can reveal
+            // the preimage, so an incoming without the handed-over key is the
+            // sender's to refund. Nothing is left for us to wait on.
+            let outgoing_done = lock_debug!(maker.wallet.read())
+                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                .outgoing_keys_for_swap(&swap_id)
+                .is_empty();
+            let incoming_unclaimable = incoming_swapcoins
+                .iter()
+                .all(|incoming| incoming.other_privkey.is_none());
+            // A next hop's hashlock claim also empties the wallet, maybe before the
+            // watcher shows its preimage, so any spend but our own refund keeps the
+            // incoming. A swap that never funded waits for its pending discard.
+            if outgoing_done
+                && incoming_unclaimable
+                && !discard_pending
+                && !claimed_downstream(chain).unwrap_or(true)
+            {
+                {
+                    let mut wallet = lock_debug!(maker.wallet.write())
+                        .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+                    for incoming in &incoming_swapcoins {
+                        let key = incoming.contract_tx.compute_txid().to_string();
+                        wallet.remove_incoming_swapcoin(&key);
+                    }
+                    wallet.save_to_disk().map_err(MakerError::Wallet)?;
                 }
+                update_tracker(&maker, &swap_id, |r| {
+                    r.phase = MakerSwapPhase::Recovered;
+                    r.recovery.phase = MakerRecoveryPhase::CleanedUp;
+                });
+
+                // Emit timelock recovery reports
+                let network = lock_debug!(maker.wallet.read())
+                    .map(|w| w.store.network.to_string())
+                    .unwrap_or_default();
+                let recovery_txids: Vec<String> = timelock_recovery_txids
+                    .iter()
+                    .map(|spending_txid| spending_txid.to_string())
+                    .collect();
+                RecoveryReport::emit_maker(
+                    &maker.data_dir,
+                    swap_id.clone(),
+                    network.clone(),
+                    "timelock".to_string(),
+                    recovery_txids,
+                );
+
+                #[cfg(feature = "integration-test")]
+                maker.shutdown.store(true, Relaxed);
+                return Ok(());
             }
         }
 
