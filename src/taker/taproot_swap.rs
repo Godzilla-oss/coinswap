@@ -378,6 +378,8 @@ impl Taker {
                 ));
             }
 
+            #[cfg(feature = "integration-test")]
+            let entered = crate::maker::handlers::funding_steps_entered(&contract_data.id);
             send_message(
                 &mut stream,
                 &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
@@ -385,6 +387,20 @@ impl Taker {
             self.swap_state_mut()?.makers[i]
                 .taproot_exchange_mut()?
                 .contract_data_sent = true;
+
+            #[cfg(feature = "integration-test")]
+            if self.races_funding_step(&maker_address)? {
+                self.wait_for_funding_step(&contract_data.id, entered)?;
+                log::warn!("Test behavior: racing duplicate contract data to maker {i}");
+                if self
+                    .resume_contract_data_exchange(&maker_address, i, &contract_data)
+                    .is_ok()
+                {
+                    return Err(TakerError::General(
+                        "Maker answered a duplicate contract data mid-funding".to_string(),
+                    ));
+                }
+            }
 
             let msg_bytes = read_message(&mut stream).map_err(TakerError::from);
             #[cfg(feature = "integration-test")]
