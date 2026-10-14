@@ -31,25 +31,25 @@ Two properties follow from this definition:
 
 ## Screening points
 
-Each participant screens every funding transaction it is shown, not only the one that pays it.
+Each participant screens only the funding for its own incoming coins, when its own `check_blocklist` setting is enabled.
 
 ```text
 Taker → Maker 1 → Maker 2 → Taker
 
 Maker 1 screens the Taker's funding
 Maker 2 screens Maker 1's funding
-Taker   screens Maker 1's and Maker 2's funding
+Taker   screens Maker 2's funding
 ```
 
-The taker verifies each maker's contracts before passing them to the next hop, and that maker's funding arrives with them, so the taker screens every hop, intermediate ones included.
-A maker is only ever shown its own incoming funding.
+The taker verifies each maker's contracts before passing them to the next hop, but applies its blocklist only to the final maker's funding, which pays the taker.
+Each maker applies its own blocklist to its incoming funding. If that maker disables screening, the taker's blocklist does not override its decision for that intermediate hop.
 
 | Swap | Role | Screens | Screened at | Counterparty funded | Cost to refuse |
 |------|------|---------|-------------|---------------------|----------------|
 | Legacy | Maker | its incoming funding | `ProofOfFunding`, before constructing its own funding | yes | reserved UTXOs released |
-| Legacy | Taker | each maker's funding | `ReqContractSigsAsRecvrAndSender` from that maker | not yet broadcast | timelock recovery |
+| Legacy | Taker | the final maker's funding | `ReqContractSigsAsRecvrAndSender` from the final maker | not yet broadcast | timelock recovery |
 | Taproot | Maker | its incoming contract | contract data, after confirmation, before constructing its own funding | yes | reserved UTXOs released |
-| Taproot | Taker | each maker's contract | contract data returned by that maker | yes | timelock recovery |
+| Taproot | Taker | the final maker's contract | contract data returned by the final maker | yes | timelock recovery |
 | Lightning swap-in | Maker | the taker's HTLC funding | `SwapInFunded`, after confirmation, before paying the invoice | yes | nothing; the taker refunds its HTLC |
 | Lightning swap-out | Taker | the maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | Lightning payment stays held until it expires or the maker cancels it |
 | Lightning routed | Taker | the second maker's HTLC funding | `SwapOutFunded`, after confirmation, before claiming | yes | first-hop timelock refund |
@@ -59,9 +59,9 @@ In Legacy, Taproot and routed swaps the taker has already funded on-chain when a
 In a direct Lightning swap-out the taker has only paid a hold invoice and has no on-chain output to refund, so refusal leaves that payment held until it expires or the maker cancels it.
 The taker always commits first, so this asymmetry follows from the protocol rather than from the blocklist.
 
-Refusing an intermediate hop aborts the whole route.
+When a maker refuses its incoming funding at an intermediate hop, it aborts the whole route.
 Every hop funded before that point waits out its timelock, the same cost as refusing the final maker.
-In Legacy the taker screens a maker's funding before that maker broadcasts it; in Taproot, just after.
+In Legacy the taker screens the final maker's funding before that maker broadcasts it; in Taproot, just after.
 
 In a Lightning swap-in the maker answers with a rejection and never pays the invoice.
 The rejection does not name the list or the entry.
@@ -80,7 +80,7 @@ Not claiming keeps the preimage private, so the maker can never settle the Light
 
 The input bound exists because each input costs one query against the participant's own node, and the transaction originates with the counterparty.
 Inputs spending the same parent share one query.
-Because the taker screens every hop, a route costs it up to 25 queries per maker funding transaction rather than only the final maker's.
+The taker makes up to 25 queries per final-maker funding transaction; intermediate funding is screened only by its receiving maker, if enabled.
 None of these queries happen while screening is off or the list is empty.
 
 Addresses encode their network, so a list compiled for one network loads as empty on another.
