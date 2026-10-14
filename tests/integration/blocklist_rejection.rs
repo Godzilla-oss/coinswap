@@ -11,7 +11,10 @@ use openswap::{
 
 use super::test_framework::*;
 
-use std::{sync::atomic::Ordering::Relaxed, thread};
+use std::{
+    sync::{atomic::Ordering::Relaxed, Arc},
+    thread,
+};
 
 #[test]
 fn maker_rejects_legacy_funding_from_blocked_address() {
@@ -25,22 +28,32 @@ fn maker_rejects_taproot_funding_from_blocked_address() {
 
 #[test]
 fn taker_rejects_legacy_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Legacy, 1, 0);
+    run_taker_screening(ProtocolVersion::Legacy, 1, 0);
 }
 
 #[test]
 fn taker_rejects_taproot_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Taproot, 1, 0);
+    run_taker_screening(ProtocolVersion::Taproot, 1, 0);
 }
 
 #[test]
-fn taker_rejects_legacy_intermediate_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Legacy, 2, 0);
+fn taker_ignores_legacy_intermediate_funding_when_receiving_maker_disables_screening() {
+    run_taker_screening(ProtocolVersion::Legacy, 2, 0);
 }
 
 #[test]
-fn taker_rejects_taproot_intermediate_funding_from_blocked_address() {
-    run_taker_rejection(ProtocolVersion::Taproot, 2, 0);
+fn taker_ignores_taproot_intermediate_funding_when_receiving_maker_disables_screening() {
+    run_taker_screening(ProtocolVersion::Taproot, 2, 0);
+}
+
+#[test]
+fn taker_rejects_legacy_final_funding_on_multihop_route() {
+    run_taker_screening(ProtocolVersion::Legacy, 2, 1);
+}
+
+#[test]
+fn taker_rejects_taproot_final_funding_on_multihop_route() {
+    run_taker_screening(ProtocolVersion::Taproot, 2, 1);
 }
 
 #[test]
@@ -374,17 +387,26 @@ fn run_violation_with_blocked_funding(protocol: ProtocolVersion) {
 }
 
 /// Route `maker_count` makers and list the funding source of the maker at
-/// route position `blocked_maker`. The taker sees every maker's funding while
-/// verifying it, so it must refuse whichever hop is listed, final or not.
-fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_maker: usize) {
+/// route position `blocked_maker`. The taker must refuse its own incoming
+/// funding, but respect an intermediate recipient's choice to disable screening.
+fn run_taker_screening(protocol: ProtocolVersion, maker_count: usize, blocked_maker: usize) {
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal; maker_count];
-    let (test_framework, mut takers, makers, block_generation_handle) =
+    let (test_framework, mut takers, mut makers, block_generation_handle) =
         TestFramework::init_with_blocklist::<BitcoindBackend>(
             maker_count,
             taker_behaviors,
             maker_behaviors,
         );
+    let reject_final_funding = blocked_maker + 1 == maker_count;
+    if !reject_final_funding {
+        // All roles share the populated list. Only the maker receiving the
+        // listed intermediate funding opts out; the taker's check stays on.
+        Arc::get_mut(&mut makers[blocked_maker + 1])
+            .expect("maker has not been shared with server threads yet")
+            .config
+            .check_blocklist = false;
+    }
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
 
@@ -408,8 +430,6 @@ fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_ma
 
     // Fidelity creation spends the deposits above. Block the resulting
     // regular change UTXO, which is the actual input to maker swap funding.
-    // With every role screening the same list, a later maker would refuse an
-    // intermediate hop too, but the taker sees each hop's funding first.
     let blocked_address = sole_regular_utxo_address(&makers[blocked_maker]);
     let outcome = taker
         .add_blocklist_entry(
@@ -426,18 +446,27 @@ fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_ma
     let summary = taker
         .prepare_swap(params)
         .expect("prepare_swap should succeed");
-    match taker.start_swap(&summary.swap_id) {
-        Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
-            assert_eq!(entry.address, blocked_address.to_string());
+    if reject_final_funding {
+        match taker.start_swap(&summary.swap_id) {
+            Err(TakerError::Blocklist(BlocklistError::BlockedAddress { entry, .. })) => {
+                assert_eq!(entry.address, blocked_address.to_string());
+            }
+            Err(other) => panic!("expected blocked-address error, got {:?}", other),
+            Ok(_) => panic!("the taker accepted funding from the maker's blocked source address"),
         }
-        Err(other) => panic!("expected blocked-address error, got {:?}", other),
-        Ok(_) => panic!("the taker accepted funding from the maker's blocked source address"),
-    }
 
-    // Every hop funded before the rejection stays locked in a contract until
-    // its timelock matures and its funder sweeps it back. Rejecting must not
-    // strand anyone's funds.
-    thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
+        // Every hop funded before the rejection must recover its coins.
+        thread::sleep(timelock_recovery_wait::<BitcoindBackend>());
+        assert!(
+            taker.wait_for_recovery(),
+            "the taker must recover its own funding after the rejection"
+        );
+    } else {
+        taker
+            .start_swap(&summary.swap_id)
+            .expect("the taker must not screen funding paid to a maker that disables screening");
+        generate_blocks(bitcoind, 1);
+    }
 
     for (i, maker) in makers.iter().enumerate() {
         maker
@@ -448,7 +477,7 @@ fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_ma
             .unwrap();
         let maker_balances = maker.wallet.read().unwrap().get_balances().unwrap();
         println!(
-            "Maker {} balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+            "Maker {} balances after swap or recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
             i,
             maker_balances.regular,
             maker_balances.swap,
@@ -461,19 +490,19 @@ fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_ma
             "Maker {} contract balance mismatch",
             i
         );
-        assert_eq!(
-            maker_balances.swap.to_sat(),
-            0,
-            "Maker {} swap balance mismatch",
-            i
-        );
+        if reject_final_funding {
+            assert_eq!(
+                maker_balances.swap.to_sat(),
+                0,
+                "Maker {} swap balance mismatch",
+                i
+            );
+        } else {
+            assert!(maker_balances.swap > Amount::ZERO);
+        }
         assert_eq!(maker_balances.fidelity, Amount::from_btc(0.05).unwrap());
     }
 
-    assert!(
-        taker.wait_for_recovery(),
-        "the taker must recover its own funding after the rejection"
-    );
     taker
         .get_wallet()
         .write()
@@ -486,6 +515,9 @@ fn run_taker_rejection(protocol: ProtocolVersion, maker_count: usize, blocked_ma
         Amount::ZERO,
         "Taker contract balance mismatch"
     );
+    if !reject_final_funding {
+        assert!(taker_balances.swap > Amount::ZERO);
+    }
 
     // A listed source is local policy, never proof of misbehaviour: no maker
     // on the route may be banned for it.

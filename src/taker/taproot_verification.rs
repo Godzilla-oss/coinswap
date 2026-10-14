@@ -401,12 +401,13 @@ impl Taker {
             }
         }
 
-        // Every maker's contract reaches the taker before the next hop sees it,
-        // so screen each hop, not only the final maker's. Screening queries the
-        // backend once per input, so it runs after the checks above have
-        // rejected any malformed contract.
-        for tx in &contract.contract_txs {
-            self.screen_funding_tx(tx)?;
+        // Only the final maker funds the taker's incoming swapcoins. Each
+        // maker applies its own policy to its incoming funding. Screen after
+        // contract validation so malformed contracts are rejected first.
+        if maker_idx + 1 == self.swap_state()?.makers.len() {
+            for tx in &contract.contract_txs {
+                self.screen_funding_tx(tx)?;
+            }
         }
 
         // Taproot's contract txs are the maker's funding txs, already broadcast

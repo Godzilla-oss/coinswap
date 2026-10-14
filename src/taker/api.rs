@@ -3919,7 +3919,7 @@ impl Taker {
             .map_err(TakerError::Blocklist)
     }
 
-    /// Screen a maker's funding transaction against the blocklist when
+    /// Screen funding for the taker's incoming coins against the blocklist when
     /// `check_blocklist` is on. A match is local policy: the caller aborts the
     /// swap, and nothing is recorded against the maker.
     pub(crate) fn screen_funding_tx(&self, tx: &Transaction) -> Result<(), TakerError> {
