@@ -20,7 +20,10 @@ pub(crate) use api::{
 pub use api::{
     min_contract_value_sats, Balances, RecoveryOutcome, SecretMnemonic, UTXOSpendInfo, Wallet,
 };
-pub use backup::WalletBackup;
+pub use backup::{
+    BondHint, OpenSwapsSummary, RestoreOptions, WalletBackup, RESTORE_FROM_MNEMONIC_HINT,
+    RESTORE_OPEN_SWAPS_WARNING,
+};
 pub use blockchain::{
     AnyBlockchain, BackendConfig, Blockchain, CoreRPC, CoreRpcConfig, Electrum, ElectrumConfig,
     FeePriority, HdOrigin,

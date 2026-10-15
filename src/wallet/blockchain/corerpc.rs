@@ -8,13 +8,13 @@ use std::{
 };
 
 use bitcoin::{
-    address::NetworkUnchecked, block::Header, Address, Block, BlockHash, OutPoint, Script,
-    Transaction, Txid,
+    address::NetworkUnchecked, block::Header, Address, Amount, Block, BlockHash, Network, OutPoint,
+    Script, Transaction, Txid,
 };
 use bitcoind::bitcoincore_rpc::{
     json::{
-        GetAddressInfoResult, GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult,
-        ListTransactionResult, ListUnspentResultEntry, ScanningDetails,
+        GetBlockchainInfoResult, GetRawTransactionResult, GetTxOutResult, ListTransactionResult,
+        ListUnspentResultEntry, ScanningDetails,
     },
     jsonrpc, Auth, Client, Error as CoreRpcError, RpcApi,
 };
@@ -458,6 +458,19 @@ impl Blockchain for CoreRPC {
             .list_transactions(label, count, skip, include_watchonly)?)
     }
 
+    fn script_has_history(&self, script: &Script, network: Network) -> Result<bool, WalletError> {
+        let address = Address::from_script(script, network)
+            .map_err(|e| WalletError::General(e.to_string()))?;
+        // The transaction list hides change outputs; the received total
+        // still counts an address after it is emptied.
+        match self.rpc.get_received_by_address(&address, Some(0)) {
+            Ok(received) => Ok(received > Amount::ZERO),
+            // -4: not imported yet. The gap loop imports the wider range and asks again.
+            Err(CoreRpcError::JsonRpc(jsonrpc::Error::Rpc(ref e))) if e.code == -4 => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn estimate_feerate(&self, priority: FeePriority) -> Result<f64, WalletError> {
         let res = self.rpc.estimate_smart_fee(priority as u16, None)?;
         let per_kvb = res.fee_rate.ok_or_else(|| {
@@ -498,15 +511,74 @@ impl Blockchain for CoreRPC {
         Ok(())
     }
 
-    fn get_address_info(&self, addr: &Address) -> Result<GetAddressInfoResult, WalletError> {
-        Ok(self.rpc.get_address_info(addr)?)
+    fn imported_range_covers(
+        &self,
+        descriptor: &str,
+        last_index: u32,
+    ) -> Result<bool, WalletError> {
+        #[derive(Deserialize)]
+        struct WalletKind {
+            descriptors: Option<bool>,
+        }
+        let kind: WalletKind = self.rpc.call("getwalletinfo", &[])?;
+        if kind.descriptors != Some(true) {
+            // Legacy wallets have no `listdescriptors`: check that the first
+            // and last address of the window are watched, as before.
+            for index in [0, last_index] {
+                let address = self
+                    .rpc
+                    .derive_addresses(descriptor, Some([index, index]))?
+                    .swap_remove(0)
+                    .assume_checked();
+                #[derive(Deserialize)]
+                struct Watched {
+                    iswatchonly: Option<bool>,
+                }
+                let info: Watched = self.rpc.call("getaddressinfo", &[json!(address)])?;
+                if info.iswatchonly != Some(true) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        #[derive(Deserialize)]
+        struct Listed {
+            desc: String,
+            range: Option<[u32; 2]>,
+        }
+        #[derive(Deserialize)]
+        struct Descriptors {
+            descriptors: Vec<Listed>,
+        }
+        let listed: Descriptors = self.rpc.call("listdescriptors", &[])?;
+        Ok(listed
+            .descriptors
+            .into_iter()
+            .find(|listed| listed.desc == descriptor)
+            .and_then(|listed| listed.range)
+            // Like the legacy check, coverage must start at index 0.
+            .is_some_and(|[start, end]| start == 0 && end >= last_index))
     }
 
     fn import_descriptors(&self, requests: &[Value]) -> Result<(), WalletError> {
-        let _res: Vec<Value> = self
+        let results: Vec<Value> = self
             .rpc
             .call("importdescriptors", &[Value::Array(requests.to_vec())])?;
-        Ok(())
+        // Core rejects a descriptor in its own result, not as an RPC error.
+        let failures: Vec<String> = requests
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| result["success"] != true)
+            .map(|(request, result)| format!("{}: {}", request["desc"], result["error"]))
+            .collect();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WalletError::General(format!(
+                "importdescriptors failed: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     fn rescan_wallet_from(&self, height: u64) -> Result<(), WalletError> {
@@ -576,6 +648,111 @@ mod tests {
     };
 
     use super::*;
+
+    /// Serves one canned reply per JSON-RPC method, failing on any other.
+    fn mock_core(
+        replies: Vec<(&'static str, Value)>,
+    ) -> (CoreRPC, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock core");
+        let addr = listener.local_addr().unwrap();
+        let expected = replies.len();
+        let server = thread::spawn(move || {
+            let mut seen = Vec::new();
+            while seen.len() < expected {
+                let (stream, _) = listener.accept().expect("accept core client");
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while seen.len() < expected && reader.read_line(&mut line).unwrap_or(0) > 0 {
+                    let mut body_len = 0;
+                    while line.trim() != "" {
+                        if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                            body_len = n.trim().parse().unwrap();
+                        }
+                        line.clear();
+                        reader.read_line(&mut line).unwrap();
+                    }
+                    line.clear();
+                    let mut body = vec![0; body_len];
+                    reader.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let method = request["method"].as_str().unwrap().to_string();
+                    let result = replies
+                        .iter()
+                        .find(|(m, _)| *m == method)
+                        .unwrap_or_else(|| panic!("unexpected call {}", method))
+                        .1
+                        .clone();
+                    seen.push(method);
+                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result, "error": null })
+                        .to_string();
+                    write!(
+                        writer,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .unwrap();
+                    writer.flush().unwrap();
+                }
+            }
+            seen
+        });
+        let core = CoreRPC::new(&CoreRpcConfig {
+            url: addr.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        (core, server)
+    }
+
+    #[test]
+    fn imported_range_covers_needs_the_range_to_start_at_zero() {
+        let desc = "wpkh(xpub/0/*)#abcd1234";
+        for (range, last_index, expected) in [
+            ([20, 200], 100, false),
+            ([0, 200], 100, true),
+            ([0, 99], 100, false),
+        ] {
+            let (core, server) = mock_core(vec![
+                (
+                    "getwalletinfo",
+                    json!({ "walletname": "w", "descriptors": true }),
+                ),
+                (
+                    "listdescriptors",
+                    json!({ "wallet_name": "w", "descriptors": [{ "desc": desc, "range": range }] }),
+                ),
+            ]);
+            assert_eq!(
+                core.imported_range_covers(desc, last_index).unwrap(),
+                expected,
+                "range {range:?}, last index {last_index}"
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn imported_range_covers_legacy_wallet_without_listdescriptors() {
+        let addr = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+        let (core, server) = mock_core(vec![
+            (
+                "getwalletinfo",
+                json!({ "walletname": "w", "descriptors": false }),
+            ),
+            ("deriveaddresses", json!([addr])),
+            (
+                "getaddressinfo",
+                json!({ "address": addr, "iswatchonly": false }),
+            ),
+        ]);
+        assert!(!core.imported_range_covers("wpkh(xpub/0/*)", 99).unwrap());
+        assert_eq!(
+            server.join().unwrap(),
+            ["getwalletinfo", "deriveaddresses", "getaddressinfo"],
+            "a legacy wallet must not reach listdescriptors"
+        );
+    }
 
     #[test]
     fn estimate_feerate_forwards_target_and_converts() {

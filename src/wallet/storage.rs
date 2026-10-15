@@ -13,7 +13,7 @@ use crate::{
     wallet::UTXOSpendInfo,
 };
 
-use super::{error::WalletError, fidelity::FidelityBond};
+use super::{backup::RestoreOptions, error::WalletError, fidelity::FidelityBond};
 
 use bitcoin::{bip32::Xpriv, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,11 @@ pub(crate) struct WalletStore {
 
     pub(super) wallet_birthday: Option<u64>,
 
+    /// Set until a restore's first scan finishes, so a restart resumes that
+    /// scan with the options the user chose.
+    #[serde(default)]
+    pub(super) pending_restore: Option<RestoreOptions>,
+
     /// Maps transaction outpoints to their associated UTXO and spend information.
     #[serde(default)] // Ensures deserialization works if `utxo_cache` is missing
     pub(super) utxo_cache: HashMap<OutPoint, (ListUnspentResultEntry, UTXOSpendInfo)>,
@@ -366,7 +371,33 @@ impl WalletStore {
         network: Network,
         master_key: Xpriv,
         wallet_birthday: Option<u64>,
+        pending_restore: Option<RestoreOptions>,
         store_enc_material: &KeyMaterial,
+    ) -> Result<Self, WalletError> {
+        Self::init_with(
+            file_name,
+            path,
+            network,
+            master_key,
+            wallet_birthday,
+            pending_restore,
+            store_enc_material,
+            |_| {},
+        )
+    }
+
+    /// Like [`WalletStore::init`], but `prepare` fills in extra state before
+    /// the first durable write, so no partial store ever reaches disk.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn init_with(
+        file_name: String,
+        path: &Path,
+        network: Network,
+        master_key: Xpriv,
+        wallet_birthday: Option<u64>,
+        pending_restore: Option<RestoreOptions>,
+        store_enc_material: &KeyMaterial,
+        prepare: impl FnOnce(&mut Self),
     ) -> Result<Self, WalletError> {
         let mut store = Self {
             file_name,
@@ -383,21 +414,19 @@ impl WalletStore {
             fidelity_bond: Vec::new(),
             last_synced_height: None,
             wallet_birthday,
+            pending_restore,
             utxo_cache: HashMap::new(),
             swap_locks: HashMap::new(),
             ln_pending_swaps: HashMap::new(),
             ln_maker_swaps: HashMap::new(),
         };
+        prepare(&mut store);
         store.master_key.seal(store_enc_material)?;
 
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Exclusive create: fails with `AlreadyExists` instead of truncating a
-        // wallet that appeared since the caller checked the path.
-        File::create_new(path)?;
-
-        store.write_to_disk(path, store_enc_material)?;
+        // No-clobber: fails with `AlreadyExists` instead of replacing a wallet
+        // that appeared since the caller checked the path, and never leaves
+        // an empty or partial file there if the write fails.
+        store.write_file(path, store_enc_material, true)?;
 
         Ok(store)
     }
@@ -413,27 +442,21 @@ impl WalletStore {
         path: &Path,
         store_enc_material: &KeyMaterial,
     ) -> Result<(), WalletError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        self.write_file(path, store_enc_material, false)
+    }
 
+    fn write_file(
+        &self,
+        path: &Path,
+        store_enc_material: &KeyMaterial,
+        no_clobber: bool,
+    ) -> Result<(), WalletError> {
         let encrypted = encrypt_struct(self, store_enc_material)
             .map_err(|e| WalletError::General(format!("wallet store encryption failed: {e:?}")))?;
-
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-        let mut writer = BufWriter::new(&mut tmp);
-        serde_cbor::to_writer(&mut writer, &encrypted)?;
-        // `Drop for BufWriter` discards flush errors, so flush explicitly:
-        // a swallowed error would rename a truncated wallet over the good one.
-        writer.flush()?;
-        drop(writer);
-        tmp.as_file().sync_all()?;
-        tmp.persist(path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // Without this the rename itself may not survive a crash.
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        write_atomic(path, no_clobber, |writer| {
+            serde_cbor::to_writer(writer, &encrypted)?;
+            Ok(())
+        })
     }
 
     /// Reads from a path (errors if path doesn't exist).
@@ -450,12 +473,63 @@ impl WalletStore {
     }
 }
 
+/// Writes `path` through a fsynced tempfile in the same directory, then
+/// renames it into place (refusing an existing file when `no_clobber`).
+/// A failure at any step leaves `path` as it was.
+fn write_atomic(
+    path: &Path,
+    no_clobber: bool,
+    write: impl FnOnce(&mut BufWriter<&mut tempfile::NamedTempFile>) -> Result<(), WalletError>,
+) -> Result<(), WalletError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut writer = BufWriter::new(&mut tmp);
+    write(&mut writer)?;
+    // `Drop for BufWriter` discards flush errors, so flush explicitly:
+    // a swallowed error would rename a truncated wallet over the good one.
+    writer.flush()?;
+    drop(writer);
+    tmp.as_file().sync_all()?;
+    if no_clobber {
+        tmp.persist_noclobber(path)
+    } else {
+        tmp.persist(path)
+    }
+    .map_err(|e| e.error)?;
+    // Without this the rename itself may not survive a crash.
+    #[cfg(not(windows))]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::SecurityError;
     use bip39::rand::{thread_rng, Rng};
     use bitcoind::tempfile::tempdir;
+
+    #[test]
+    fn failed_first_write_leaves_no_wallet_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet");
+        let failed = write_atomic(&path, true, |_| Err(WalletError::General("cut".into())));
+        assert!(failed.is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "neither the wallet nor a tempfile may remain"
+        );
+
+        // So a retry writes it, and a second no-clobber write refuses to replace it.
+        write_atomic(&path, true, |w| Ok(w.write_all(b"first")?)).unwrap();
+        assert!(write_atomic(&path, true, |w| Ok(w.write_all(b"second")?)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+    }
 
     #[test]
     fn test_write_and_read_wallet_to_disk() {
@@ -474,6 +548,7 @@ mod tests {
             &file_path,
             Network::Bitcoin,
             master_key,
+            None,
             None,
             &encryption_material,
         )
@@ -543,6 +618,7 @@ mod tests {
             Network::Bitcoin,
             xpriv,
             None,
+            None,
             &encryption_material,
         )
         .unwrap();
@@ -575,6 +651,7 @@ mod tests {
             Network::Bitcoin,
             master_key,
             None,
+            None,
             &encryption_material,
         )
         .unwrap();
@@ -603,6 +680,7 @@ mod tests {
             &file_path,
             Network::Bitcoin,
             master_key,
+            None,
             None,
             &encryption_material,
         )

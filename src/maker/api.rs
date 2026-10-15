@@ -37,7 +37,7 @@ use crate::{
         min_contract_value_sats,
         swapcoin::{IncomingSwapCoin, OutgoingSwapCoin},
         AddressType, AnyBlockchain, BackendConfig, Blockchain, CoreRpcConfig, FeePriority,
-        FidelityError, RecoveryOutcome, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
+        FidelityError, RecoveryOutcome, RestoreOptions, Wallet, WalletError, MAX_FIDELITY_TIMELOCK,
         MIN_FIDELITY_BOND_AMOUNT_SATS, MIN_FIDELITY_TIMELOCK,
     },
     watch_tower::service::WatchService,
@@ -824,6 +824,40 @@ pub struct IdleSwapData {
 }
 
 impl MakerServer {
+    /// Restores `config.wallet_name` from a backup file, or from a seed phrase
+    /// prompted for. Runs before `init`, which would create a fresh wallet.
+    pub fn restore_wallet(
+        config: &MakerServerConfig,
+        backup_file: Option<&Path>,
+        options: RestoreOptions,
+    ) -> Result<(), MakerError> {
+        let path = config.data_dir.join("wallets").join(&config.wallet_name);
+        match backup_file {
+            Some(file) => {
+                Wallet::restore_interactive(&file.to_path_buf(), &config.backend, &path, options)?
+            }
+            None => Wallet::restore_from_mnemonic_interactive(&path, &config.backend, options)?,
+        }
+        Ok(())
+    }
+
+    /// Writes an encrypted backup of the existing wallet. Never creates one.
+    pub fn backup_wallet(
+        mut config: MakerServerConfig,
+        output: Option<PathBuf>,
+    ) -> Result<(), MakerError> {
+        let path = config.data_dir.join("wallets").join(&config.wallet_name);
+        if !path.exists() {
+            return Err(WalletError::General(format!("no wallet at {path:?} to back up")).into());
+        }
+        // Probe first so a down backend gets the clear backup error, not a load error.
+        let blockchain = AnyBlockchain::from_config(&config.backend)?;
+        Wallet::require_backend(&blockchain)?;
+        let wallet = Wallet::load(&path, blockchain, config.password.take())?;
+        Wallet::backup_interactive(&wallet, output)?;
+        Ok(())
+    }
+
     /// Initialize a maker server. The backend (Bitcoin Core or Electrum) is
     /// resolved from `config` via [`MakerServerConfig::backend`].
     pub fn init(mut config: MakerServerConfig) -> Result<Self, MakerError> {
@@ -1096,12 +1130,9 @@ impl MakerServer {
     ) -> Result<Option<u32>, MakerError> {
         let bond = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .store
-            .fidelity_bond
-            .get(index as usize)
+            .fidelity_bond(index)
             .cloned();
         let checked = bond
-            .ok_or(WalletError::Fidelity(FidelityError::BondDoesNotExist))
             .and_then(|bond| bond.ensure_broadcast(chain))
             .and_then(|txid| chain.tx_block_height(&txid))
             .and_then(|height| {
@@ -1265,10 +1296,8 @@ impl MakerServer {
             let wallet_read = lock_debug!(self.wallet.read())
                 .map_err(|_| MakerError::General("Failed to lock wallet"))?;
             let bond = wallet_read
-                .store
-                .fidelity_bond
-                .get(i as usize)
-                .ok_or(MakerError::General("fidelity bond index stale"))?
+                .fidelity_bond(i)
+                .map_err(|_| MakerError::General("fidelity bond index stale"))?
                 .clone();
             let (current_height, tip_time) = wallet_read.chain_tip().map_err(MakerError::Wallet)?;
             let bond_value = wallet_read
